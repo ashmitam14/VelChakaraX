@@ -26,8 +26,10 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { askQuestion } from '../api/policypilot'
 import ChatInput from '../components/ChatInput'
 import MessageBubble from '../components/MessageBubble'
+import RiskSimulationPanel from '../components/RiskSimulationPanel'
 import Sidebar from '../components/Sidebar'
 
 const navItems = [
@@ -35,6 +37,7 @@ const navItems = [
   { id: 'chat', label: 'AI Chat' },
   { id: 'bookmarks', label: 'Bookmarks' },
   { id: 'risk', label: 'Risk Assessment' },
+  { id: 'simulator', label: 'Risk Simulator' },
   { id: 'history', label: 'History' },
   { id: 'settings', label: 'Settings' },
 ]
@@ -86,11 +89,12 @@ export default function Chat() {
   const [activeSection, setActiveSection] = useState('dashboard')
   const [messages, setMessages] = useState(starterMessages)
   const [prompt, setPrompt] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const trimmedPrompt = prompt.trim()
 
-    if (!trimmedPrompt) {
+    if (!trimmedPrompt || isLoading) {
       return
     }
 
@@ -100,14 +104,31 @@ export default function Chat() {
       text: trimmedPrompt,
     }
 
-    const assistantMessage = {
-      id: `${Date.now()}-assistant`,
-      role: 'assistant',
-      text: 'I analyzed your query. I can map relevant controls, cite policy sections, and suggest compliance actions based on your governance context.',
-    }
-
-    setMessages((current) => [...current, userMessage, assistantMessage])
+    setMessages((current) => [...current, userMessage])
     setPrompt('')
+    setIsLoading(true)
+
+    try {
+      const data = await askQuestion(trimmedPrompt)
+      const assistantMessage = {
+        id: `${Date.now()}-assistant`,
+        role: 'assistant',
+        text: data.answer || 'I could not find this information in the uploaded documents.',
+      }
+
+      setMessages((current) => [...current, assistantMessage])
+    } catch (error) {
+      const errorMessage = {
+        id: `${Date.now()}-assistant-error`,
+        role: 'assistant',
+        text: 'I could not reach the backend service right now. Please make sure the backend server is running on http://localhost:8000.',
+      }
+
+      setMessages((current) => [...current, errorMessage])
+      console.error('Chat request failed:', error)
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const handleLogout = () => {
@@ -281,6 +302,16 @@ export default function Chat() {
           {messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}
+
+          {isLoading && (
+            <MessageBubble
+              message={{
+                id: 'loading-assistant',
+                role: 'assistant',
+                text: 'Thinking…',
+              }}
+            />
+          )}
         </section>
       </div>
     )
@@ -947,6 +978,10 @@ export default function Chat() {
     )
   }
 
+  const renderRiskSimulator = () => {
+    return <RiskSimulationPanel />
+  }
+
   const renderSettings = () => {
     return (
       <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -1019,6 +1054,10 @@ export default function Chat() {
 
     if (activeSection === 'risk') {
       return renderRisk()
+    }
+
+    if (activeSection === 'simulator') {
+      return renderRiskSimulator()
     }
 
     if (activeSection === 'history') {

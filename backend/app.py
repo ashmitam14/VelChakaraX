@@ -1,8 +1,11 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from risk_engine import SystemDescription, run_simulation
 
 import ollama
 
@@ -10,6 +13,19 @@ import ollama
 # FastAPI App
 # -----------------------------
 app = FastAPI(title="AI Compliance Assistant")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------
 # Configuration
@@ -40,6 +56,11 @@ class Question(BaseModel):
 # -----------------------------
 # API Endpoint
 # -----------------------------
+@app.post("/simulate")
+def simulate(system: SystemDescription):
+    return run_simulation(system)
+
+
 @app.post("/ask")
 def ask_question(data: Question):
 
