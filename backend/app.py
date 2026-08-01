@@ -19,6 +19,7 @@ from db.models import (
 import ollama
 import datetime
 import re
+from string import Template
 
 # -----------------------------
 # FastAPI App
@@ -27,9 +28,13 @@ app = FastAPI(title="AI Compliance Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
+allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
@@ -38,25 +43,144 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+import json
+import os
+import shutil
+
 # -----------------------------
 # Configuration
 # -----------------------------
 CHROMA_FOLDER = "chroma_db"
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {
+        "chunk_size": 512,
+        "chunk_overlap": 64,
+        "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "top_k": 6
+    }
 
 # -----------------------------
-# Load Embedding Model
+# Load Embedding Model and DB
 # -----------------------------
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+global_db = None
+global_embedding_model = None
+
+def reload_vector_db():
+    global global_db, global_embedding_model
+    config = load_config()
+    global_embedding_model = HuggingFaceEmbeddings(
+        model_name=config.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+    )
+    global_db = Chroma(
+        persist_directory=CHROMA_FOLDER,
+        embedding_function=global_embedding_model
+    )
+
+# Initialize on startup
+reload_vector_db()
 
 # -----------------------------
-# Load ChromaDB
+# PolicyMind System Prompt
 # -----------------------------
-db = Chroma(
-    persist_directory=CHROMA_FOLDER,
-    embedding_function=embedding_model
-)
+POLICYMIND_SYSTEM_PROMPT = Template("""You are PolicyMind, an AI Governance & Compliance Assistant.
+
+Your job is to analyze AI systems and return compliance guidance based ONLY on the retrieved regulatory documents provided to you in context.
+
+===========================================================
+NON-NEGOTIABLE OUTPUT RULES (read before answering)
+===========================================================
+1. NEVER respond in a paragraph. Every single response MUST use the exact section structure below, in the exact order below, with Markdown "##" headings.
+2. If you catch yourself writing more than 2 consecutive sentences without a bullet, STOP and reformat as bullets.
+3. Do NOT skip a section. If a section has no data, write exactly: "Not available in the uploaded knowledge base." — never omit the heading itself.
+4. Do NOT merge sections. Do NOT rename sections. Do NOT add extra sections.
+5. Never invent a regulation, article number, statistic, or score. Only use what is present in the retrieved context.
+6. Output the Knowledge Graph section as raw JSON only — no prose, no markdown fence commentary before/after it.
+7. Keep the "Detailed Answer" section to bullet points only — 5 to 10 bullets, no narrative paragraphs.
+
+===========================================================
+REQUIRED OUTPUT FORMAT (follow this structure exactly)
+===========================================================
+
+## Risk Level
+[LOW | MEDIUM | HIGH | PROHIBITED]
+Reasoning: <one line>
+
+## Applicable Regulations
+- <Regulation Name>
+  - Article/Section: <value or "Not available in the uploaded knowledge base.">
+  - Why it applies: <one line>
+
+(repeat for each regulation found)
+
+## Compliance Score
+Compliance Score: <0-100>%
+Status: [Compliant | Partially Compliant | Non-Compliant]
+
+## Primary Category
+<one category, e.g. "Facial Recognition", "Recruitment AI", "Healthcare AI">
+
+## Detailed Answer
+- Purpose: <bullet>
+- Applicable regulations: <bullet>
+- Why they apply: <bullet>
+- Key obligations: <bullet>
+- Compliance expectations: <bullet>
+(5–10 bullets total, no paragraphs)
+
+## Compliance Checklist
+✔ Data Governance — <short reason>
+✔ Transparency — <short reason>
+✔ Human Oversight — <short reason>
+✔ Technical Documentation — <short reason>
+✔ Risk Management — <short reason>
+✔ Record Keeping — <short reason>
+✔ Cybersecurity — <short reason>
+✔ Accuracy — <short reason>
+❌ Prohibited Practices — <short reason>
+(use ✔ if satisfied/expected, ⚠ if partial, ❌ if missing/violated)
+
+## Knowledge Graph
+{
+  "nodes": [ { "id": "1", "label": "<use case>", "type": "Use Case" } ],
+  "edges": [ { "source": "1", "target": "2", "label": "regulated by" } ]
+}
+
+## Potential Compliance Risks
+- <Risk name> — <1-2 line explanation>
+- <Risk name> — <1-2 line explanation>
+
+## Recommendations
+✔ <actionable recommendation>
+✔ <actionable recommendation>
+✔ <actionable recommendation>
+
+## Sources Used
+<Regulation Name> — <Article/Section if available>
+<Regulation Name> — <Article/Section if available>
+
+===========================================================
+FINAL REMINDER (highest priority — overrides any drift above)
+===========================================================
+- Your response is ONLY valid if it contains all 9 "##" headings above, in that order.
+- Do NOT write a single flowing paragraph anywhere in the response.
+- Do NOT summarize the analysis in prose before or after the structured sections — the structured sections ARE the entire answer.
+- Base every claim strictly on retrieved documents. If information is missing, say so explicitly per section — never guess.
+
+===========================================================
+RETRIEVED REGULATORY CONTEXT (base every claim ONLY on this)
+===========================================================
+$context
+
+===========================================================
+QUESTION FROM USER
+===========================================================
+$question
+""")
 
 # -----------------------------
 # Request Models
@@ -176,11 +300,14 @@ def ask_question(data: Question, session: Session = Depends(get_db)):
 
     print("🔥 FUNCTION CALLED")
 
+    config = load_config()
+    top_k = int(config.get("top_k", 6))
+
     # Retrieve documents using MMR
-    retriever = db.as_retriever(
+    retriever = global_db.as_retriever(
         search_type="mmr",
         search_kwargs={
-            "k": 5,
+            "k": top_k,
             "fetch_k": 20
         }
     )
@@ -212,33 +339,10 @@ def ask_question(data: Question, session: Session = Depends(get_db)):
     # -----------------------------
     # Prompt
     # -----------------------------
-    prompt = f"""
-You are an AI Policy Compliance Assistant.
-
-Answer ONLY using the context below.
-
-If the answer exists in the context, explain it in simple and professional language.
-
-Do not copy large sections verbatim.
-
-Summarize the important points.
-
-If the answer does not exist, reply exactly:
-
-I could not find this information in the uploaded documents.
-
-Context:
-{context}
-
-Question:
-{data.question}
-
-Return your response in this format:
-
-Answer:
-Relevant Regulations:
-Recommendation:
-"""
+    prompt = POLICYMIND_SYSTEM_PROMPT.substitute(
+        context=context,
+        question=data.question,
+    )
 
     # -----------------------------
     # Generate Response
@@ -249,9 +353,12 @@ Recommendation:
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful AI Policy Compliance Assistant. "
-                    "Always answer using the provided context. "
-                    "If the context contains the answer, explain it clearly and professionally."
+                    "You are PolicyMind, an AI Governance & Compliance Assistant. "
+                    "Follow the required output format in the user prompt exactly: all 9 '##' "
+                    "headings in order, bullet points only, no invented regulations, raw JSON "
+                    "Knowledge Graph, and strict adherence to the retrieved context. "
+                    "If information is missing from the context, state 'Not available in the "
+                    "uploaded knowledge base.' — never guess."
                 )
             },
             {
@@ -489,5 +596,52 @@ def list_documents(session: Session = Depends(get_db)):
             "totalChunks": d.total_chunks,
             "ingestedAt": d.ingested_at.isoformat(),
         }
-        for d in docs
     ]
+
+# -----------------------------
+# Settings & Ingestion
+# -----------------------------
+@app.get("/settings")
+def get_settings():
+    return load_config()
+
+@app.post("/settings")
+def update_settings(settings: dict):
+    config = load_config()
+    config.update(settings)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    return {"status": "success", "settings": config}
+
+@app.post("/rebuild")
+def rebuild_vector_index():
+    try:
+        from ingest import rebuild_index
+        rebuild_index()
+        reload_vector_db()
+        return {"status": "success", "message": "Index rebuilt successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import UploadFile, File
+
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    data_dir = "data"
+    os.makedirs(data_dir, exist_ok=True)
+    file_path = os.path.join(data_dir, file.filename)
+    
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    
+    # Automatically rebuild the index to include the new file
+    try:
+        from ingest import rebuild_index
+        rebuild_index()
+        reload_vector_db()
+        return {"status": "success", "message": f"{file.filename} uploaded and indexed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to index file: {str(e)}")

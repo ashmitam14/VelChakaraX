@@ -5,11 +5,16 @@ import { Link, useNavigate } from 'react-router-dom'
 export default function Login() {
   const navigate = useNavigate()
   const [showPassword, setShowPassword] = useState(false)
+  const [loginMode, setLoginMode] = useState('user') // 'user' or 'admin'
 
   const handleSubmit = (event) => {
     event.preventDefault()
-    // Backend auth will be wired later. For now, route directly to chat.
-    navigate('/chat')
+    // Backend auth will be wired later.
+    if (loginMode === 'admin') {
+      navigate('/admin/dashboard')
+    } else {
+      navigate('/chat')
+    }
   }
 
   return (
@@ -24,6 +29,32 @@ export default function Login() {
         <div className="mb-7 text-center">
           <h1 className="text-3xl font-semibold tracking-tight text-slate-900">PolicyMind</h1>
           <p className="mt-2 text-sm text-slate-500">Welcome back! Please sign in to continue.</p>
+        </div>
+
+        {/* User / Admin Toggle */}
+        <div className="mb-6 flex rounded-xl bg-slate-100 p-1">
+          <button
+            type="button"
+            onClick={() => setLoginMode('user')}
+            className={`flex-1 rounded-lg py-2 text-sm font-medium transition-all ${
+              loginMode === 'user'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            User
+          </button>
+          <button
+            type="button"
+            onClick={() => setLoginMode('admin')}
+            className={`flex-1 rounded-lg py-2 text-sm font-medium transition-all ${
+              loginMode === 'admin'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            Admin
+          </button>
         </div>
 
         <div className="space-y-4">
