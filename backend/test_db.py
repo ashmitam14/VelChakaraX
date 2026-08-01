@@ -1,21 +1,84 @@
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
+"""Quick connectivity test for the PostgreSQL database used by PolicyMind.
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
+Usage:
+    (venv) python test_db.py
+"""
+
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from sqlalchemy import text
+from db.session import engine, Base
+from db.models import (
+    User, ChatSession, ChatMessage, Simulation,
+    Bookmark, BookmarkRegulation, HistoryEntry, Document
 )
 
-db = Chroma(
-    persist_directory="chroma_db",
-    embedding_function=embedding_model
-)
 
-query = "What is the DPDP Act?"
+def main():
+    print("=" * 60)
+    print("  PolicyMind PostgreSQL Connectivity Test")
+    print("=" * 60)
 
-results = db.similarity_search(query, k=3)
+    try:
+        # 1. Connect
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT version()"))
+            version = result.scalar()
+            print(f"\n✅ Connected to PostgreSQL")
+            print(f"   Server: {version}")
 
-print("Retrieved:", len(results))
+        # 2. Ensure tables exist
+        Base.metadata.create_all(bind=engine)
+        print("✅ Tables verified / created.")
 
-for i, doc in enumerate(results, start=1):
-    print(f"\n===== CHUNK {i} =====")
-    print(doc.page_content)
+        # 3. List tables
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' ORDER BY table_name"
+            )).fetchall()
+            print("\nTables in database:")
+            for row in rows:
+                print(f"   - {row[0]}")
+
+        # 4. Quick insert + read roundtrip
+        from db.session import SessionLocal
+        session = SessionLocal()
+        try:
+            chat = ChatSession(title="DB test session")
+            session.add(chat)
+            session.flush()
+            msg = ChatMessage(
+                session_id=chat.id,
+                role="user",
+                content="Hello PostgreSQL test",
+            )
+            session.add(msg)
+            session.commit()
+
+            count = session.query(ChatMessage).count()
+            print(f"\n✅ Roundtrip insert OK (chat_messages count = {count})")
+
+            # cleanup
+            session.delete(msg)
+            session.delete(chat)
+            session.commit()
+        finally:
+            session.close()
+
+        print("\n" + "=" * 60)
+        print("  ✅ All PostgreSQL checks passed!")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\n❌ Database connection failed: {e}")
+        print("\n   Make sure PostgreSQL is installed and running.")
+        print("   Check connection settings in backend/.env")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

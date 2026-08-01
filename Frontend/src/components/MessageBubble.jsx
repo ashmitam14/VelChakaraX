@@ -1,6 +1,7 @@
 import { Bot, User } from 'lucide-react'
+import MessageActions from './MessageActions'
 
-export default function MessageBubble({ message }) {
+export default function MessageBubble({ message, onBookmark }) {
   const isUser = message.role === 'user'
 
   return (
@@ -15,15 +16,19 @@ export default function MessageBubble({ message }) {
           {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
         </div>
 
-        <div
-          className={[
-            'rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm',
-            isUser
-              ? 'rounded-br-md bg-blue-600 text-white'
-              : 'rounded-bl-md border border-slate-200 bg-white text-slate-700',
-          ].join(' ')}
-        >
-          {message.text}
+        <div className="w-full">
+          <div
+            className={[
+              'rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm',
+              isUser
+                ? 'rounded-br-md bg-blue-600 text-white'
+                : 'rounded-bl-md border border-slate-200 bg-white text-slate-700',
+            ].join(' ')}
+          >
+            {message.text}
+          </div>
+
+          {!isUser && <MessageActions message={message} onBookmark={onBookmark} />}
         </div>
       </div>
     </div>

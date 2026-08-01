@@ -33,8 +33,14 @@ const sources = [
   },
 ];
 
-export default function MessageActions() {
+export default function MessageActions({ message, onBookmark }) {
   const [open, setOpen] = useState(false);
+
+  const handleBookmark = () => {
+    if (onBookmark) {
+      onBookmark(message)
+    }
+  }
 
   return (
     <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -48,6 +54,7 @@ export default function MessageActions() {
 
       <button
         type="button"
+        onClick={handleBookmark}
         className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:border-slate-300 hover:bg-slate-50"
       >
         <Bookmark className="h-3.5 w-3.5" />

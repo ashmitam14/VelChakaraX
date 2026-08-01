@@ -1,13 +1,24 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional, Any
+
+from sqlalchemy.orm import Session
 
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from risk_engine import SystemDescription, run_simulation
 
+from db.session import get_db, engine, Base
+from db.models import (
+    User, ChatSession, ChatMessage, Simulation,
+    Bookmark, BookmarkRegulation, HistoryEntry, Document
+)
+
 import ollama
+import datetime
+import re
 
 # -----------------------------
 # FastAPI App
@@ -48,21 +59,120 @@ db = Chroma(
 )
 
 # -----------------------------
-# Request Model
+# Request Models
 # -----------------------------
 class Question(BaseModel):
     question: str
 
+
+class BookmarkRegulationIn(BaseModel):
+    order: int = 1
+    title: str
+    clause: Optional[str] = None
+    completed: bool = False
+
+
+class BookmarkCreate(BaseModel):
+    bookmark_type: str = "chat"  # "chat" | "simulation"
+    title: str
+    summary: Optional[str] = None
+    question: Optional[str] = None
+    chat_messages: Optional[Any] = None
+    regulations: List[BookmarkRegulationIn] = []
+
+
+class BookmarkToggleItem(BaseModel):
+    regulation_id: int
+    completed: bool
+
+
 # -----------------------------
-# API Endpoint
+# DB Helpers
+# -----------------------------
+def serialize_bookmark(bookmark: Bookmark) -> dict:
+    return {
+        "id": f"chat-{bookmark.id}" if bookmark.bookmark_type == "chat" else f"sim-{bookmark.id}",
+        "type": bookmark.bookmark_type,
+        "title": bookmark.title,
+        "summary": bookmark.summary or "",
+        "question": bookmark.question or "",
+        "chatMessages": bookmark.chat_messages or [],
+        "createdAt": bookmark.created_at.isoformat(),
+        "updatedAt": bookmark.updated_at.isoformat() if bookmark.updated_at else None,
+        "regulations": [
+            {
+                "id": f"reg-{r.id}",
+                "order": r.order,
+                "title": r.title,
+                "clause": r.clause or "",
+                "completed": r.completed,
+            }
+            for r in sorted(bookmark.regulations, key=lambda x: x.order)
+        ],
+    }
+
+
+def serialize_history(entry: HistoryEntry) -> dict:
+    return {
+        "id": f"history-{entry.id}",
+        "title": entry.title,
+        "summary": entry.summary or "",
+        "createdAt": entry.created_at.isoformat(),
+        "completedAt": entry.completed_at.isoformat(),
+        "question": entry.question or "",
+        "messages": entry.messages or [],
+        "regulations": entry.regulations or [],
+        "type": entry.entry_type,
+        "score": entry.score,
+    }
+
+
+# -----------------------------
+# Health check
+# -----------------------------
+@app.get("/")
+def health():
+    return {"status": "ok", "service": "AI Compliance Assistant"}
+
+
+@app.get("/health/db")
+def db_health():
+    try:
+        Base.metadata.create_all(bind=engine)
+        return {"database": "connected"}
+    except Exception as e:
+        return {"database": "error", "detail": str(e)}
+
+
+# -----------------------------
+# API Endpoint: Simulate
 # -----------------------------
 @app.post("/simulate")
-def simulate(system: SystemDescription):
-    return run_simulation(system)
+def simulate(system: SystemDescription, session: Session = Depends(get_db)):
+
+    results = run_simulation(system)
+
+    # Persist the simulation
+    try:
+        sim = Simulation(
+            jurisdiction=system.get("jurisdiction", "both"),
+            system_description=dict(system),
+            results=results,
+        )
+        session.add(sim)
+        session.commit()
+    except Exception as e:
+        print("⚠️ Failed to persist simulation:", e)
+        session.rollback()
+
+    return results
 
 
+# -----------------------------
+# API Endpoint: Ask
+# -----------------------------
 @app.post("/ask")
-def ask_question(data: Question):
+def ask_question(data: Question, session: Session = Depends(get_db)):
 
     print("🔥 FUNCTION CALLED")
 
@@ -83,12 +193,18 @@ def ask_question(data: Question):
 
     context = ""
 
+    source_meta = []
     for i, doc in enumerate(docs, start=1):
         print(f"\n---------- CHUNK {i} ----------")
         print(doc.page_content[:500])
         print("-------------------------------")
 
         context += doc.page_content + "\n\n"
+        source_meta.append({
+            "chunk": i,
+            "source": getattr(doc.metadata, "get", lambda k, d=None: d)("source"),
+            "content_preview": doc.page_content[:200],
+        })
 
     print("\nContext Length:", len(context))
     print("=" * 80)
@@ -145,9 +261,233 @@ Recommendation:
         ]
     )
 
+    answer = response["message"]["content"]
+
+    # -----------------------------
+    # Persist the Q&A
+    # -----------------------------
+    try:
+        chat_session = session.query(ChatSession).order_by(ChatSession.id.desc()).first()
+        if chat_session is None:
+            chat_session = ChatSession(title=data.question[:80])
+            session.add(chat_session)
+            session.flush()
+
+        user_msg = ChatMessage(
+            session_id=chat_session.id,
+            role="user",
+            content=data.question,
+            source_documents=source_meta,
+        )
+        assistant_msg = ChatMessage(
+            session_id=chat_session.id,
+            role="assistant",
+            content=answer,
+            prompt=data.question,
+            source_documents=source_meta,
+        )
+        session.add_all([user_msg, assistant_msg])
+        session.commit()
+    except Exception as e:
+        print("⚠️ Failed to persist chat:", e)
+        session.rollback()
+
     # -----------------------------
     # Return Response
     # -----------------------------
     return {
-        "answer": response["message"]["content"]
+        "answer": answer
     }
+
+
+# -----------------------------
+# Chat history endpoints
+# -----------------------------
+@app.get("/chat/messages", response_model=List[dict])
+def list_chat_messages(limit: int = Query(100, ge=1, le=500), session: Session = Depends(get_db)):
+    messages = (
+        session.query(ChatMessage)
+        .order_by(ChatMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": f"msg-{m.id}",
+            "role": m.role,
+            "text": m.content,
+            "prompt": m.prompt,
+            "createdAt": m.created_at.isoformat(),
+            "sourceDocuments": m.source_documents or [],
+        }
+        for m in reversed(messages)
+    ]
+
+
+@app.get("/chat/sessions", response_model=List[dict])
+def list_chat_sessions(session: Session = Depends(get_db)):
+    sessions = session.query(ChatSession).order_by(ChatSession.id.desc()).limit(50).all()
+    result = []
+    for s in sessions:
+        result.append({
+            "id": s.id,
+            "title": s.title or "New chat",
+            "createdAt": s.created_at.isoformat(),
+            "messageCount": len(s.messages),
+        })
+    return result
+
+
+@app.delete("/chat/messages/{message_id}")
+def delete_chat_message(message_id: int, session: Session = Depends(get_db)):
+    msg = session.get(ChatMessage, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    session.delete(msg)
+    session.commit()
+    return {"deleted": message_id}
+
+
+# -----------------------------
+# Simulations history
+# -----------------------------
+@app.get("/simulations", response_model=List[dict])
+def list_simulations(limit: int = Query(100, ge=1, le=500), session: Session = Depends(get_db)):
+    sims = session.query(Simulation).order_by(Simulation.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": sim.id,
+            "jurisdiction": sim.jurisdiction,
+            "systemDescription": sim.system_description,
+            "results": sim.results,
+            "createdAt": sim.created_at.isoformat(),
+        }
+        for sim in sims
+    ]
+
+
+# -----------------------------
+# Bookmarks CRUD
+# -----------------------------
+@app.get("/bookmarks", response_model=List[dict])
+def list_bookmarks(session: Session = Depends(get_db)):
+    bookmarks = session.query(Bookmark).order_by(Bookmark.id.desc()).all()
+    return [serialize_bookmark(b) for b in bookmarks]
+
+
+@app.post("/bookmarks", response_model=dict)
+def create_bookmark(payload: BookmarkCreate, session: Session = Depends(get_db)):
+    bookmark = Bookmark(
+        bookmark_type=payload.bookmark_type,
+        title=payload.title,
+        summary=payload.summary,
+        question=payload.question,
+        chat_messages=payload.chat_messages,
+    )
+    for item in payload.regulations:
+        bookmark.regulations.append(
+            BookmarkRegulation(
+                order=item.order,
+                title=item.title,
+                clause=item.clause,
+                completed=item.completed,
+            )
+        )
+    session.add(bookmark)
+    session.commit()
+    session.refresh(bookmark)
+    return serialize_bookmark(bookmark)
+
+
+def _parse_id(raw: str) -> int:
+    """Extract the numeric ID from a frontend string ID like 'chat-5', 'reg-3'."""
+    match = re.search(r"(\d+)$", str(raw))
+    if not match:
+        raise HTTPException(status_code=400, detail=f"Invalid ID format: {raw}")
+    return int(match.group(1))
+
+
+@app.patch("/bookmarks/{bookmark_id}/items/{regulation_id}")
+def toggle_bookmark_item(
+    bookmark_id: str,
+    regulation_id: str,
+    session: Session = Depends(get_db),
+):
+    b_id = _parse_id(bookmark_id)
+    r_id = _parse_id(regulation_id)
+
+    regulation = session.get(BookmarkRegulation, r_id)
+    if not regulation or regulation.bookmark_id != b_id:
+        raise HTTPException(status_code=404, detail="Regulation item not found")
+
+    regulation.completed = not regulation.completed
+    session.commit()
+
+    bookmark = session.get(Bookmark, b_id)
+    return serialize_bookmark(bookmark)
+
+
+@app.delete("/bookmarks/{bookmark_id}")
+def delete_bookmark(bookmark_id: str, session: Session = Depends(get_db)):
+    b_id = _parse_id(bookmark_id)
+    bookmark = session.get(Bookmark, b_id)
+    if not bookmark:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    session.delete(bookmark)
+    session.commit()
+    return {"deleted": b_id}
+
+
+# -----------------------------
+# History endpoints
+# -----------------------------
+@app.get("/history", response_model=List[dict])
+def list_history(session: Session = Depends(get_db)):
+    entries = session.query(HistoryEntry).order_by(HistoryEntry.id.desc()).all()
+    return [serialize_history(e) for e in entries]
+
+
+@app.post("/history", response_model=dict)
+def create_history_entry(payload: dict, session: Session = Depends(get_db)):
+    entry = HistoryEntry(
+        title=payload.get("title", "Untitled"),
+        summary=payload.get("summary"),
+        entry_type=payload.get("type", "chat"),
+        question=payload.get("question"),
+        messages=payload.get("messages"),
+        regulations=payload.get("regulations"),
+        score=payload.get("score"),
+    )
+    session.add(entry)
+    session.commit()
+    session.refresh(entry)
+    return serialize_history(entry)
+
+
+@app.delete("/history/{entry_id}")
+def delete_history_entry(entry_id: int, session: Session = Depends(get_db)):
+    entry = session.get(HistoryEntry, entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    session.delete(entry)
+    session.commit()
+    return {"deleted": entry_id}
+
+
+# -----------------------------
+# Documents
+# -----------------------------
+@app.get("/documents", response_model=List[dict])
+def list_documents(session: Session = Depends(get_db)):
+    docs = session.query(Document).order_by(Document.id.desc()).all()
+    return [
+        {
+            "id": d.id,
+            "filename": d.filename,
+            "filePath": d.file_path,
+            "totalPages": d.total_pages,
+            "totalChunks": d.total_chunks,
+            "ingestedAt": d.ingested_at.isoformat(),
+        }
+        for d in docs
+    ]

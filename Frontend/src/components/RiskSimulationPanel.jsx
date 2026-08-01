@@ -29,6 +29,7 @@ const decisionLevelOptions = ['fully_automated', 'human_assisted']
 const jurisdictionOptions = ['eu', 'india', 'both']
 const deploymentStatusOptions = ['not_launched', 'already_deployed']
 const orgSizeOptions = ['startup', 'sme', 'enterprise']
+const BOOKMARK_KEY = 'policymind-bookmarks'
 
 function getTierClasses(tier) {
   if (!tier) {
@@ -103,6 +104,31 @@ export default function RiskSimulationPanel() {
     })
   }
 
+  const saveBookmark = (label, result) => {
+    if (!result || typeof window === 'undefined') {
+      return
+    }
+
+    const nextBookmark = {
+      id: `${label}-${Date.now()}`,
+      title: `${label.toUpperCase()} AI risk review`,
+      summary: `${system.sector} deployment in ${system.jurisdiction} jurisdiction for ${system.decision_level} decision-making.`,
+      createdAt: new Date().toISOString(),
+      regulations: result.checklist.map((item, index) => ({
+        id: `${label}-${index + 1}`,
+        order: index + 1,
+        title: item.replace(/^⚠\s*/, '').trim(),
+        clause: result.matched_clause,
+        completed: false,
+      })),
+    }
+
+    const existing = JSON.parse(localStorage.getItem(BOOKMARK_KEY) || '[]')
+    const updated = [nextBookmark, ...existing].slice(0, 25)
+    localStorage.setItem(BOOKMARK_KEY, JSON.stringify(updated))
+    window.dispatchEvent(new CustomEvent('policymind-bookmarks-updated', { detail: updated }))
+  }
+
   const renderResultCard = (label, result) => {
     if (!result) return null
 
@@ -130,6 +156,14 @@ export default function RiskSimulationPanel() {
             ))}
           </ul>
         </div>
+
+        <button
+          type="button"
+          onClick={() => saveBookmark(label, result)}
+          className="mt-4 inline-flex items-center rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
+        >
+          Save to bookmarks
+        </button>
       </div>
     )
   }
